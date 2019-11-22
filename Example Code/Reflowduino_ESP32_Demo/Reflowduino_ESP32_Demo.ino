@@ -63,6 +63,8 @@ SPIClass SPI2(HSPI); // We are using HSPI pins on the ESP32
 #define MAX_CS 27 // MAX31855 chip select pin
 #define MAX_DO 12 // MAX31855 data pin (HSPI MISO on ESP32)
 
+#define RELAY_ACTIVE_HIGH true
+
 // Initialize Bluetooth software serial
 
 // Initialize thermocouple
@@ -88,10 +90,10 @@ Adafruit_MAX31855 thermocouple(MAX_CLK, MAX_CS, MAX_DO);
 //#define T_reflow 100 - T_const
 
 #define T_cool 40 // Safe temperature at which the board is "ready" (dinner bell sounds!)
-#define preheat_rate 2 // Increase of 1-3 *C/s
+#define preheat_rate 2.0 // Increase of 1-3 *C/s
 #define soak_rate 0.7 // Increase of 0.5-1 *C/s
-#define reflow_rate 2 // Increase of 1-3 *C/s
-#define cool_rate -4 // Decrease of < 6 *C/s max to prevent thermal shock. Negative sign indicates decrease
+#define reflow_rate 2.0 // Increase of 1-3 *C/s
+#define cool_rate -4.0 // Decrease of < 6 *C/s max to prevent thermal shock. Negative sign indicates decrease
 
 // Define PID parameters. The gains depend on your particular setup
 // but these values should be good enough to get you started
@@ -131,7 +133,7 @@ int windowSize = 2000;
 unsigned long sendRate = 2000; // Send data to app every 2s
 unsigned long t_start = 0; // For keeping time during reflow process
 unsigned long previousMillis = 0;
-unsigned long duration, t_final, windowStartTime, timer;
+unsigned long duration, windowStartTime, timer;
 
 class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -164,7 +166,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         Serial.println("<-- ***Reflow process started!"); // Left arrow means it received a command
       }
       else if (rxValue.find(stopReflow) != -1) { // Command to stop reflow process
-        digitalWrite(relay, LOW); // Turn off appliance and set flag to stop PID control
+        digitalWrite(relay, !RELAY_ACTIVE_HIGH); // Turn off appliance and set flag to stop PID control
         reflow = false;
         Serial.println("<-- ***Reflow process aborted!");
       }
@@ -183,7 +185,7 @@ void setup() {
   pinMode(relay, OUTPUT);
 
   digitalWrite(LED, LOW);
-  digitalWrite(relay, LOW); // Set default relay state to OFF
+  digitalWrite(relay, !RELAY_ACTIVE_HIGH); // Set default relay state to OFF
 
   myPID.SetOutputLimits(0, windowSize);
   myPID.SetSampleTime(PID_sampleTime);
@@ -257,12 +259,13 @@ void loop() {
         preheatComplete = true;
         t_start = millis(); // Reset timer for next phase
         Serial.println("Preheat phase complete!");
+        myPID.SetTunings(Kp_soak, Ki_soak, Kd_soak);
       }
       else {
-        // Calculate the projected final time based on temperature points and temperature rates
-        t_final = (T_preheat - T_start) / (preheat_rate / 1000.0) + t_start;
-        // Calculate desired temperature at that instant in time using linear interpolation
-        setPoint = duration * (T_preheat - T_start) / (t_final - t_start);
+        // Increment setpoint for PID by maximum rate of the current phase
+        setPoint = duration * (preheat_rate / 1000) + T_start;
+        if (setPoint > T_preheat)
+          setPoint = T_preheat;
       }
     }
     /********************* SOAK *********************/
@@ -271,10 +274,12 @@ void loop() {
         soakComplete = true;
         t_start = millis();
         Serial.println("Soaking phase complete!");
+        myPID.SetTunings(Kp_reflow, Ki_reflow, Kd_reflow);
       }
       else {
-        t_final = (T_soak - T_start) / (soak_rate / 1000.0) + t_start;
-        setPoint = duration * (T_soak - T_start) / (t_final - t_start);
+        setPoint = duration * (soak_rate / 1000) + T_preheat;
+        if (setPoint > T_soak)
+          setPoint = T_soak;
       }
     }
     /********************* REFLOW *********************/
@@ -285,8 +290,9 @@ void loop() {
         Serial.println("Reflow phase complete!");
       }
       else {
-        t_final = (T_reflow - T_start) / (reflow_rate / 1000.0) + t_start;
-        setPoint = duration * (T_reflow - T_start) / (t_final - t_start);
+        setPoint = duration * (reflow_rate / 1000) + T_soak;
+        if (setPoint > T_reflow)
+          setPoint = T_reflow;
       }
     }
     /********************* COOLDOWN *********************/
@@ -301,25 +307,28 @@ void loop() {
         pCharacteristic->notify(); // Send value to the app
       }
       else {
-        t_final = (T_cool - T_start) / (cool_rate / 1000.0) + t_start;
-        setPoint = duration * (T_cool - T_start) / (t_final - t_start);
+        setPoint = duration * (cool_rate / 1000) + T_reflow;
+        if (setPoint < T_cool)
+          setPoint = T_cool;
       }
     }
 
-    // Use the appropriate PID parameters based on the current phase
-    if (!soakComplete) myPID.SetTunings(Kp_soak, Ki_soak, Kd_soak);
-    else if (!reflowComplete) myPID.SetTunings(Kp_reflow, Ki_reflow, Kd_reflow);
-    
     // Compute PID output (from 0 to windowSize) and control relay accordingly
     myPID.Compute(); // This will only be evaluated at the PID sampling rate
-    if (millis() - windowStartTime >= windowSize) windowStartTime += windowSize; // Shift the time window
-    if (output > millis() - windowStartTime) digitalWrite(relay, HIGH); // If HIGH turns on the relay
-//    if (output < millis() - windowStartTime) digitalWrite(relay, HIGH); // If LOW turns on the relay
-    else digitalWrite(relay, LOW);
+    if (millis() - windowStartTime >= windowSize) {
+      windowStartTime += windowSize; // Shift the time window
+      Serial.print("-->    Setpoint: ");
+      Serial.println(setPoint);
+    }
+
+    if (output > millis() - windowStartTime)
+      digitalWrite(relay, RELAY_ACTIVE_HIGH);
+    else
+      digitalWrite(relay, !RELAY_ACTIVE_HIGH);
   }
   else {
     digitalWrite(LED, LOW);
-    digitalWrite(relay, LOW);
+    digitalWrite(relay, !RELAY_ACTIVE_HIGH);
   }
 
   /***************************** BLUETOOTH CODE *****************************/
